@@ -68,7 +68,7 @@ struct client_ctx {
     struct server_env_t *env; // __weak_ptr
     struct tunnel_cipher_ctx *cipher;
     struct buffer_t *init_pkg;
-    s5_ctx *parser;  /* The SOCKS protocol parser. */
+    struct s5_ctx *parser;  /* The SOCKS protocol parser. */
     enum tunnel_stage stage;
     void (*original_tunnel_shutdown)(struct tunnel_ctx *tunnel); /* ptr holder */
     char *sec_websocket_key;
@@ -77,7 +77,7 @@ struct client_ctx {
     bool tls_is_eof;
 };
 
-static struct buffer_t * initial_package_create(const s5_ctx *parser);
+static struct buffer_t * initial_package_create(const struct s5_ctx *parser);
 static void do_next(struct tunnel_ctx *tunnel, struct socket_ctx *socket);
 static void do_handshake(struct tunnel_ctx *tunnel);
 static void do_handshake_auth(struct tunnel_ctx *tunnel);
@@ -137,8 +137,7 @@ static bool init_done_cb(struct tunnel_ctx *tunnel, void *p) {
 
     cstl_set_container_add(ctx->env->tunnel_set, tunnel);
 
-    ctx->parser = (s5_ctx *)calloc(1, sizeof(s5_ctx));
-    s5_init(ctx->parser);
+    ctx->parser = s5_ctx_create();
     ctx->cipher = NULL;
     ctx->stage = tunnel_stage_handshake;
 
@@ -177,39 +176,11 @@ void client_shutdown(struct server_env_t *env) {
     cstl_set_container_traverse(env->tunnel_set, &_do_shutdown_tunnel, NULL);
 }
 
-static struct buffer_t * initial_package_create(const s5_ctx *parser) {
-    struct buffer_t *buffer = buffer_create(SSR_BUFF_SIZE);
-
-    uint8_t *iter = buffer->buffer;
-    uint8_t len;
-    iter[0] = (uint8_t)parser->atyp;
-    iter++;
-
-    switch (parser->atyp) {
-    case s5_atyp_ipv4:  // IPv4
-        memcpy(iter, parser->daddr, sizeof(struct in_addr));
-        iter += sizeof(struct in_addr);
-        break;
-    case s5_atyp_ipv6:  // IPv6
-        memcpy(iter, parser->daddr, sizeof(struct in6_addr));
-        iter += sizeof(struct in6_addr);
-        break;
-    case s5_atyp_host:
-        len = (uint8_t)strlen((char *)parser->daddr);
-        iter[0] = len;
-        iter++;
-        memcpy(iter, parser->daddr, len);
-        iter += len;
-        break;
-    default:
-        ASSERT(0);
-        break;
-    }
-    *((unsigned short *)iter) = htons(parser->dport);
-    iter += sizeof(unsigned short);
-
-    buffer->len = iter - buffer->buffer;
-
+static struct buffer_t * initial_package_create(const struct s5_ctx *parser) {
+    size_t s = 0;
+    uint8_t *b = s5_address_package_create(parser, &malloc, &s);
+    struct buffer_t *buffer = buffer_create_from(b, s);
+    free(b);
     return buffer;
 }
 
@@ -299,10 +270,10 @@ static void do_handshake(struct tunnel_ctx *tunnel) {
     enum s5_auth_method methods;
     struct socket_ctx *incoming = tunnel->incoming;
     struct client_ctx *ctx = (struct client_ctx *) tunnel->data;
-    s5_ctx *parser = ctx->parser;
+    struct s5_ctx *parser = ctx->parser;
     uint8_t *data;
     size_t size;
-    enum s5_err err;
+    enum s5_result result;
 
     ASSERT(incoming->rdstate == socket_state_stop);
     ASSERT(incoming->wrstate == socket_state_stop);
@@ -315,8 +286,8 @@ static void do_handshake(struct tunnel_ctx *tunnel) {
 
     data = (uint8_t *)incoming->buf->base;
     size = (size_t)incoming->result;
-    err = s5_parse(parser, &data, &size);
-    if (err == s5_ok) {
+    result = s5_parse(parser, &data, &size);
+    if (result == s5_result_need_more) {
         socket_read(incoming, true);
         ctx->stage = tunnel_stage_handshake;  /* Need more data. */
         return;
@@ -332,8 +303,8 @@ static void do_handshake(struct tunnel_ctx *tunnel) {
         return;
     }
 
-    if (err != s5_auth_select) {
-        pr_err("handshake error: %s", s5_strerror(err));
+    if (result != s5_result_auth_select) {
+        pr_err("handshake error: %s", str_s5_result(result));
         tunnel->tunnel_shutdown(tunnel);
         return;
     }
@@ -383,10 +354,10 @@ static void do_parse_s5_request(struct tunnel_ctx *tunnel) {
     struct socket_ctx *incoming = tunnel->incoming;
     struct socket_ctx *outgoing = tunnel->outgoing;
     struct client_ctx *ctx = (struct client_ctx *) tunnel->data;
-    s5_ctx *parser = ctx->parser;
+    struct s5_ctx *parser = ctx->parser;
     uint8_t *data;
     size_t size;
-    enum s5_err err;
+    enum s5_result result;
     struct server_env_t *env = ctx->env;
     struct server_config *config = env->config;
 
@@ -406,8 +377,8 @@ static void do_parse_s5_request(struct tunnel_ctx *tunnel) {
 
     socks5_address_parse(data+3, size-3, tunnel->desired_addr);
 
-    err = s5_parse(parser, &data, &size);
-    if (err == s5_ok) {
+    result = s5_parse(parser, &data, &size);
+    if (result == s5_result_need_more) {
         socket_read(incoming, true);
         ctx->stage = tunnel_stage_s5_request;  /* Need more data. */
         return;
@@ -419,20 +390,20 @@ static void do_parse_s5_request(struct tunnel_ctx *tunnel) {
         return;
     }
 
-    if (err != s5_exec_cmd) {
-        pr_err("request error: %s", s5_strerror(err));
+    if (result != s5_result_exec_cmd) {
+        pr_err("request error: %s", str_s5_result(result));
         tunnel->tunnel_shutdown(tunnel);
         return;
     }
 
-    if (parser->cmd == s5_cmd_tcp_bind) {
+    if (s5_get_cmd(parser) == s5_cmd_tcp_bind) {
         /* Not supported but relatively straightforward to implement. */
         pr_warn("BIND requests are not supported.");
         tunnel->tunnel_shutdown(tunnel);
         return;
     }
 
-    if (parser->cmd == s5_cmd_udp_assoc) {
+    if (s5_get_cmd(parser) == s5_cmd_udp_assoc) {
         // UDP ASSOCIATE requests
         size_t len = incoming->buf->len;
         uint8_t *buf = build_udp_assoc_package(config->udp, config->listen_host, config->listen_port,
@@ -442,7 +413,7 @@ static void do_parse_s5_request(struct tunnel_ctx *tunnel) {
         return;
     }
 
-    ASSERT(parser->cmd == s5_cmd_tcp_connect);
+    ASSERT(s5_get_cmd(parser) == s5_cmd_tcp_connect);
 
     ctx->init_pkg = initial_package_create(parser);
     ctx->cipher = tunnel_cipher_create(ctx->env, 1452);
@@ -655,20 +626,16 @@ static void do_socks5_reply_success(struct tunnel_ctx *tunnel) {
     struct socket_ctx *incoming = tunnel->incoming;
     struct socket_ctx *outgoing = tunnel->outgoing;
     uint8_t *buf;
-    size_t init_data_len = 0;
-    const uint8_t *init_data = buffer_get_data(ctx->init_pkg, &init_data_len);
-    buf = (uint8_t *)calloc(3 + init_data_len + 1, sizeof(uint8_t));
+    size_t size = 0;
+
+    buf = s5_connect_response_package(ctx->parser, &malloc, &size);
 
     ASSERT(incoming->rdstate == socket_state_stop);
     ASSERT(incoming->wrstate == socket_state_stop);
     ASSERT(outgoing->rdstate == socket_state_stop);
     ASSERT(outgoing->wrstate == socket_state_stop);
 
-    buf[0] = 5;  // Version.
-    buf[1] = 0;  // Success.
-    buf[2] = 0;  // Reserved.
-    memcpy(buf + 3, init_data, init_data_len);
-    socket_write(incoming, buf, 3 + init_data_len);
+    socket_write(incoming, buf, size);
     free(buf);
     ctx->stage = tunnel_stage_auth_completion_done;
 }
@@ -748,7 +715,7 @@ static void tunnel_dying(struct tunnel_ctx *tunnel) {
         tunnel_cipher_release(ctx->cipher);
     }
     buffer_release(ctx->init_pkg);
-    free(ctx->parser);
+    s5_ctx_release(ctx->parser);
     if (ctx->sec_websocket_key) { free(ctx->sec_websocket_key); }
     buffer_release(ctx->server_delivery_cache);
     buffer_release(ctx->local_write_cache);
